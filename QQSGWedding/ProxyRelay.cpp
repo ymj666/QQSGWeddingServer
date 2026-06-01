@@ -19,17 +19,16 @@
 
 #include "ProxyRelay.h"
 #include "Globals.h"
+#include "../../GameOffsets.h"
 
 // Suppress deprecation warnings for inet_addr etc.
 #pragma warning(disable: 4996)
 
 // ============ Game Memory Addresses ============
-static constexpr DWORD ADDR_NET_OBJ_PTR   = 0x1363DD0;
+// Game address macros from GameOffsets.h:
+//   ADDR_SEND_PACKET_ECX (net obj ptr), ADDR_TIMER_OBJ, ADDR_GET_GAME_TIME, ADDR_BASE
 static constexpr DWORD KEY_OFFSET          = 0x08;
 static constexpr DWORD KEY_SIZE            = 16;
-static constexpr DWORD ADDR_TIMER_OBJ      = 0x13517C8;
-static constexpr DWORD FN_GET_GAME_TIME    = 0x802220;
-static constexpr DWORD ADDR_BASE           = 0x1351660;
 static constexpr DWORD OFF_GAME_MAP        = 0x0C;
 static constexpr DWORD OFF_MASTER          = 0x2A0;
 static constexpr DWORD OFF_PLAYER_X        = 0x18;
@@ -39,7 +38,7 @@ static constexpr DWORD OFF_PLAYER_NAME     = 0x87D0;
 static constexpr DWORD PLAYER_NAME_MAX     = 32;
 
 // ============ Config ============
-static char s_proxyIP[64]      = "129.204.252.233";  // 固定代理IP
+static char s_proxyIP[64]      = "106.53.152.52";  // 固定代理IP
 static WORD s_proxyPort        = 19900;
 static bool s_redirectEnabled  = true;              // 直接启用重定向
 static char s_serverName[32]   = {0};               // 检测到的服务器名称（仅日志用）
@@ -64,6 +63,22 @@ static SOCKET    s_proxySock                  = INVALID_SOCKET;
 static bool      s_initialized               = false;
 static bool      s_connectHookInstalled       = false;
 static ULONGLONG s_lastTickTime               = 0;
+
+// ============ Receive Framework State ============
+static constexpr int RECV_BUF_SIZE   = 4096;
+static constexpr int MAX_PAYLOAD_LEN = 1024;
+static constexpr int RECV_HEADER_LEN = 6;     // 4B magic + 2B LE payload_len
+static constexpr int MAX_HANDLERS    = 16;
+
+static BYTE s_recvBuf[RECV_BUF_SIZE]  = {0};
+static int  s_recvLen                 = 0;
+
+struct MsgHandlerEntry {
+    DWORD           magic;
+    ProxyMsgHandler handler;
+};
+static MsgHandlerEntry s_handlers[MAX_HANDLERS] = {};
+static int             s_handlerCount            = 0;
 
 // ============ Connect Hook State ============
 typedef int (WSAAPI *PFN_connect)(SOCKET, const struct sockaddr*, int);
@@ -101,7 +116,7 @@ static void LoadProxyConfig()
 // ============ Read TEA Key from Game Memory ============
 static bool ReadTEAKey(BYTE* outKey)
 {
-    DWORD netObj = *(DWORD*)ADDR_NET_OBJ_PTR;
+    DWORD netObj = *(DWORD*)ADDR_SEND_PACKET_ECX;
     if (netObj == 0 || netObj == 0xFFFFFFFF)
         return false;
 
@@ -189,7 +204,7 @@ static bool ReadPlayerInfo(WORD* x, WORD* y, DWORD* handle)
 
 // ============ Read Game Time ============
 typedef __int64 (__thiscall *PFN_GetGameTime)(int);
-static const PFN_GetGameTime fnGetGameTime = (PFN_GetGameTime)FN_GET_GAME_TIME;
+static const PFN_GetGameTime fnGetGameTime = (PFN_GetGameTime)ADDR_GET_GAME_TIME;
 
 static __int64 ReadGameTime()
 {
@@ -539,6 +554,68 @@ static bool SendPlayerInfo(SOCKET sock, WORD x, WORD y, DWORD handle)
     return sent == 16;
 }
 
+// ============ Protocol: Send Wedding Config (WCFG) ============
+// Format: "WCFG" + 2B gentle_start + 2B gentle_interval + 2B aggressive_start + 2B aggressive_interval + 2B aggressive_count = 14 bytes
+void SendWeddingConfig(WORD gentleInterval, WORD gentleCount, WORD aggressiveStart, WORD aggressiveInterval, WORD aggressiveCount)
+{
+    if (s_proxySock == INVALID_SOCKET) {
+        Log("[ProxyRelay] WCFG: not connected to proxy\n");
+        return;
+    }
+    char buf[14];
+    memcpy(buf, "WCFG", 4);
+    memcpy(buf + 4, &gentleInterval, 2);
+    memcpy(buf + 6, &gentleCount, 2);
+    memcpy(buf + 8, &aggressiveStart, 2);
+    memcpy(buf + 10, &aggressiveInterval, 2);
+    memcpy(buf + 12, &aggressiveCount, 2);
+    int sent = send(s_proxySock, buf, 14, 0);
+    if (sent == 14) {
+        Log("[ProxyRelay] WCFG sent: gentle=%dms x%d, aggressive=%dms前/%dms x%d\n",
+            gentleInterval, gentleCount, aggressiveStart, aggressiveInterval, aggressiveCount);
+    } else {
+        Log("[ProxyRelay] WCFG send FAILED (sent=%d err=%d)\n", sent, WSAGetLastError());
+    }
+}
+
+// ============ Protocol: Send Gentle Enable (WGEN) ============
+// Format: "WGEN" + 1B enable = 5 bytes
+void SendGentleEnable(bool enable)
+{
+    if (s_proxySock == INVALID_SOCKET) {
+        Log("[ProxyRelay] WGEN: not connected to proxy\n");
+        return;
+    }
+    char buf[5];
+    memcpy(buf, "WGEN", 4);
+    buf[4] = enable ? 1 : 0;
+    int sent = send(s_proxySock, buf, 5, 0);
+    if (sent == 5) {
+        Log("[ProxyRelay] WGEN sent: enable=%d\n", enable);
+    } else {
+        Log("[ProxyRelay] WGEN send FAILED (sent=%d err=%d)\n", sent, WSAGetLastError());
+    }
+}
+
+// ============ Protocol: Send NPC Trigger (NTRG) ============
+// Format: "NTRG" + 2B count(LE) = 6 bytes
+void SendNpcTrigger(WORD count)
+{
+    if (s_proxySock == INVALID_SOCKET) {
+        Log("[ProxyRelay] NTRG: not connected to proxy\n");
+        return;
+    }
+    char buf[6];
+    memcpy(buf, "NTRG", 4);
+    memcpy(buf + 4, &count, 2);  // LE
+    int sent = send(s_proxySock, buf, 6, 0);
+    if (sent == 6) {
+        Log("[ProxyRelay] NTRG sent: count=%d\n", count);
+    } else {
+        Log("[ProxyRelay] NTRG send FAILED (sent=%d err=%d)\n", sent, WSAGetLastError());
+    }
+}
+
 // ============ Server Name Detection (仅日志用) ============
 // 从游戏窗口标题解析服务器名称, 仅用于日志记录
 // IP 已固定写死, 不再根据服务器名切换
@@ -565,6 +642,115 @@ static void DetectServerFromTitle()
     }
 }
 
+// ============ Receive: Process Buffer ============
+static bool ProcessRecvBuffer()
+{
+    while (s_recvLen >= RECV_HEADER_LEN) {
+        DWORD magic;
+        WORD payloadLen;
+        memcpy(&magic, s_recvBuf, 4);
+        memcpy(&payloadLen, s_recvBuf + 4, 2);  // LE
+
+        if (payloadLen > MAX_PAYLOAD_LEN) {
+            Log("[ProxyRelay] RX: payload too large (%d), stream corrupted\n", payloadLen);
+            return false;
+        }
+
+        int msgTotalLen = RECV_HEADER_LEN + payloadLen;
+        if (s_recvLen < msgTotalLen) {
+            break;
+        }
+
+        const BYTE* payload = s_recvBuf + RECV_HEADER_LEN;
+        bool handled = false;
+        for (int i = 0; i < s_handlerCount; i++) {
+            if (s_handlers[i].magic == magic) {
+                s_handlers[i].handler(payload, payloadLen);
+                handled = true;
+                break;
+            }
+        }
+
+        if (!handled) {
+            char magicStr[5] = {0};
+            memcpy(magicStr, &magic, 4);
+            Log("[ProxyRelay] RX: unhandled magic '%s' (%d bytes)\n", magicStr, payloadLen);
+        }
+
+        s_recvLen -= msgTotalLen;
+        if (s_recvLen > 0) {
+            memmove(s_recvBuf, s_recvBuf + msgTotalLen, s_recvLen);
+        }
+    }
+    return true;
+}
+
+// ============ Receive: Poll & Read ============
+static void ProxyRelayRecv()
+{
+    if (s_proxySock == INVALID_SOCKET) return;
+
+    for (;;) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(s_proxySock, &readfds);
+        struct timeval tv = {0, 0};
+
+        int selResult = select(0, &readfds, NULL, NULL, &tv);
+        if (selResult <= 0) break;
+
+        int space = RECV_BUF_SIZE - s_recvLen;
+        if (space <= 0) {
+            s_recvLen = 0;
+            break;
+        }
+
+        int recvd = recv(s_proxySock, (char*)(s_recvBuf + s_recvLen), space, 0);
+        if (recvd <= 0) {
+            Log("[ProxyRelay] RX: recv returned %d (err=%d), disconnecting\n",
+                recvd, WSAGetLastError());
+            closesocket(s_proxySock);
+            s_proxySock = INVALID_SOCKET;
+            s_recvLen = 0;
+            return;
+        }
+
+        s_recvLen += recvd;
+    }
+
+    if (s_recvLen > 0) {
+        if (!ProcessRecvBuffer()) {
+            closesocket(s_proxySock);
+            s_proxySock = INVALID_SOCKET;
+            s_recvLen = 0;
+        }
+    }
+}
+
+// ============ Register Message Handler ============
+bool ProxyRelayRegisterHandler(const char* magic4, ProxyMsgHandler handler)
+{
+    if (!magic4 || !handler) return false;
+
+    DWORD magic;
+    memcpy(&magic, magic4, 4);
+
+    for (int i = 0; i < s_handlerCount; i++) {
+        if (s_handlers[i].magic == magic) {
+            s_handlers[i].handler = handler;
+            return true;
+        }
+    }
+
+    if (s_handlerCount >= MAX_HANDLERS) return false;
+
+    s_handlers[s_handlerCount].magic = magic;
+    s_handlers[s_handlerCount].handler = handler;
+    s_handlerCount++;
+    Log("[ProxyRelay] Handler registered for '%.4s'\n", magic4);
+    return true;
+}
+
 // ============ Public API ============
 
 void ProxyRelayInit()
@@ -589,6 +775,9 @@ void ProxyRelayInit()
 void ProxyRelayTick()
 {
     if (!s_initialized) return;
+
+    // Always poll for incoming messages every frame (not rate-limited)
+    ProxyRelayRecv();
 
     // Rate-limit to ~5Hz (every 200ms)
     ULONGLONG now = GetTickCount64();
@@ -711,6 +900,9 @@ void ProxyRelayCleanup()
         closesocket(s_proxySock);
         s_proxySock = INVALID_SOCKET;
     }
+
+    s_recvLen = 0;
+    s_handlerCount = 0;
 
     UninstallConnectHook();
     WSACleanup();

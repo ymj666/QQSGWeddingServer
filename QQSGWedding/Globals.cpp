@@ -3,9 +3,9 @@
 // === Funcs 命名空间定义 ===
 namespace Funcs
 {
-    OriginalFuncType originalFunction = (OriginalFuncType)0x7AC6F0;
-    SendPacketType SendPacket = (SendPacketType)0x1740C5B;
-    LuaType Lua = (LuaType)0xACF580;
+    OriginalFuncType originalFunction = (OriginalFuncType)ADDR_ORIGINAL_FUNCTION;
+    SendPacketType SendPacket = (SendPacketType)ADDR_SEND_PACKET;
+    LuaType Lua = (LuaType)ADDR_LUA;
 }
 
 // === HWND 句柄 ===
@@ -15,6 +15,20 @@ HWND Edit_hwnd_SingleCode = 0;
 HWND Button_hwnd_Login = 0;
 HWND CheckBox_hwnd_AutoWeddingDate = 0;
 HWND Edit_hwnd_WeddingDate = 0, Edit_hwnd_WeddingInterval = 0;
+
+// === 婚礼爆发 UI 句柄 (两段式) ===
+HWND Edit_hwnd_GentleInterval = 0, Edit_hwnd_GentleCount = 0;
+HWND Button_hwnd_GentleToggle = 0;
+HWND Edit_hwnd_AggressiveStart = 0, Edit_hwnd_AggressiveInterval = 0, Edit_hwnd_AggressiveCount = 0;
+HWND Button_hwnd_SyncWedding = 0;
+
+// === 婚礼倒计时 UI 句柄 ===
+HWND Static_WeddingCountdown = 0;
+
+// === NPC触发 UI 句柄 ===
+HWND Edit_hwnd_NpcTriggerCount = 0;
+HWND Button_NpcTrigger = 0;
+HWND Static_NpcTriggerProgress = 0;
 
 // === 挤线 UI 句柄 ===
 HWND Edit_hwnd_LineX = 0, Edit_hwnd_LineY = 0, Edit_hwnd_TargetLine = 0;
